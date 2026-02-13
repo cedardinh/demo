@@ -1,0 +1,32 @@
+{
+  "name": "demo",
+  "version": "1.0.0",
+  "description": "x402 MCP weather chat agent",
+  "main": "dist/server/mcp-weather-server.js",
+  "scripts": {
+    "dev": "tsx server/mcp-weather-server.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server/mcp-weather-server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "@scure/base": "^2.0.0",
+    "@solana/kit": "^5.5.1",
+    "@x402/axios": "^2.3.0",
+    "@x402/evm": "^2.3.1",
+    "@x402/svm": "^2.3.0",
+    "axios": "^1.13.5",
+    "dotenv": "^17.3.1",
+    "viem": "^2.45.3",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

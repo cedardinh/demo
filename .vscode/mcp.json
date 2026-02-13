@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "x402WeatherAgent": {
+      "type": "stdio",
+      "command": "npm",
+      "args": ["run", "dev"],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  }
+}

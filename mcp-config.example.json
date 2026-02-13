@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "x402-weather-agent": {
+      "command": "npm",
+      "args": ["run", "dev"],
+      "cwd": "/absolute/path/to/demo",
+      "env": {
+        "EVM_PRIVATE_KEY": "0xyour_private_key",
+        "RESOURCE_SERVER_URL": "http://localhost:4021",
+        "ENDPOINT_PATH": "/weather"
+      }
+    }
+  }
+}
