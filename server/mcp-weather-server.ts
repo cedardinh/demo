@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import axios from "axios";
-import { decodePaymentResponseHeader, x402Client, wrapAxiosWithPayment } from "@x402/axios";
+import { x402Client, wrapAxiosWithPayment } from "@x402/axios";
 import { registerExactEvmScheme } from "@x402/evm/exact/client";
 import { registerExactSvmScheme } from "@x402/svm/exact/client";
 import { privateKeyToAccount } from "viem/accounts";
@@ -9,25 +9,41 @@ import { base58 } from "@scure/base";
 import { config } from "dotenv";
 import { z } from "zod";
 
+// 加载本地 .env 到 process.env，供 MCP 运行时读取私钥与接口配置。
 config();
 
+// 运行时配置说明：
+// - 私钥决定由哪个钱包执行 x402 支付签名
+// - baseURL/endpointPath 决定天气数据请求目标
+// - timeout 用于避免在聊天客户端中长时间卡住
 const evmPrivateKey = process.env.EVM_PRIVATE_KEY as `0x${string}` | undefined;
 const svmPrivateKey = process.env.SVM_PRIVATE_KEY;
 const baseURL = process.env.RESOURCE_SERVER_URL ?? "http://localhost:4021";
 const endpointPath = process.env.ENDPOINT_PATH ?? "/weather";
 const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS ?? 15000);
 
+// 至少需要一个可用签名器（EVM 或 SVM），否则无法完成任何 x402 支付流程。
 if (!evmPrivateKey && !svmPrivateKey) {
   throw new Error("At least one of EVM_PRIVATE_KEY or SVM_PRIVATE_KEY must be provided");
 }
 
+/**
+ * 构建带 x402 自动支付能力的 axios 客户端。
+ *
+ * 流程：
+ * 1) 创建 x402 客户端容器
+ * 2) 使用配置中的私钥注册 EVM 和/或 SVM 支付方案
+ * 3) 用支付中间件包装 axios，使 HTTP 402 可自动支付并重试
+ */
 async function createPaidHttpClient() {
   const client = new x402Client();
 
+  // 若提供了 EVM 私钥，则注册 EVM 签名器（例如 Base Sepolia）。
   if (evmPrivateKey) {
     registerExactEvmScheme(client, { signer: privateKeyToAccount(evmPrivateKey) });
   }
 
+  // 若提供了 SVM 私钥，则注册 SVM（Solana）签名器。
   if (svmPrivateKey) {
     const kitModule = (await import("@solana/kit")) as unknown as {
       createKeyPairSignerFromBytes: (secret: Uint8Array) => Promise<unknown>;
@@ -45,26 +61,25 @@ async function createPaidHttpClient() {
   );
 }
 
-type PaymentMeta = {
-  paymentSuccess: boolean;
-  transactionHash: string | null;
+type RawToolResult = {
+  ok: boolean;
+  source: {
+    url: string;
+    path: string;
+  };
+  request: Record<string, unknown>;
+  upstream: {
+    status: number | null;
+    payment_response_header: string | null;
+    x_payment_response_header: string | null;
+    data: unknown;
+  };
 };
 
-type PaymentRequirementMeta = {
-  reason: string | null;
-  payer: string | null;
-  network: string | null;
-  requiredAmount: string | null;
-  asset: string | null;
-  payTo: string | null;
-};
-
-type DataResult = {
-  payment_success: boolean;
-  transaction_hash: string | null;
-  weather_json: unknown;
-};
-
+/**
+ * 以不区分大小写的方式读取响应头。
+ * Axios/Node 可能会对 header 名做不同规范化，因此同时尝试原始/小写/大写键名。
+ */
 function getHeaderValue(headers: unknown, key: string): string | undefined {
   if (!headers || typeof headers !== "object") {
     return undefined;
@@ -77,45 +92,7 @@ function getHeaderValue(headers: unknown, key: string): string | undefined {
   return typeof direct === "string" ? direct : undefined;
 }
 
-function extractPaymentMeta(headers: unknown): PaymentMeta {
-  const encoded = getHeaderValue(headers, "payment-response") ?? getHeaderValue(headers, "x-payment-response");
-  if (!encoded) {
-    return {
-      paymentSuccess: false,
-      transactionHash: null
-    };
-  }
-
-  try {
-    const decoded = decodePaymentResponseHeader(encoded);
-    return {
-      paymentSuccess: Boolean(decoded.success),
-      transactionHash: decoded.transaction ?? null
-    };
-  } catch {
-    return {
-      paymentSuccess: false,
-      transactionHash: null
-    };
-  }
-}
-
-function extractPaymentRequirementMeta(error: unknown): PaymentRequirementMeta | null {
-  if (!axios.isAxiosError(error) || error.response?.status !== 402) {
-    return null;
-  }
-  const data = error.response.data as Record<string, unknown> | undefined;
-  const accepts = Array.isArray(data?.accepts) ? (data.accepts[0] as Record<string, unknown> | undefined) : undefined;
-  return {
-    reason: typeof data?.error === "string" ? data.error : null,
-    payer: typeof data?.payer === "string" ? data.payer : null,
-    network: typeof accepts?.network === "string" ? accepts.network : null,
-    requiredAmount: typeof accepts?.maxAmountRequired === "string" ? accepts.maxAmountRequired : null,
-    asset: typeof accepts?.asset === "string" ? accepts.asset : null,
-    payTo: typeof accepts?.payTo === "string" ? accepts.payTo : null
-  };
-}
-
+// 安全序列化工具，避免因循环引用导致输出渲染失败。
 function safeJsonStringify(value: unknown): string {
   try {
     return JSON.stringify(value, null, 2);
@@ -124,83 +101,21 @@ function safeJsonStringify(value: unknown): string {
   }
 }
 
-function pickString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value : null;
+/**
+ * 统一输出原始响应，避免在服务端进行业务字段解析。
+ * 由上层 AI 根据该 JSON 自行解释并组织人类可读内容。
+ */
+function toRawOutput(result: RawToolResult): string {
+  return safeJsonStringify(result);
 }
 
-function buildWeatherPreview(weatherJson: unknown): string[] {
-  if (!weatherJson || typeof weatherJson !== "object") {
-    return ["- Weather data: unavailable"];
-  }
-
-  const payload = weatherJson as Record<string, unknown>;
-  const city = pickString(payload.city);
-  const weather = pickString(payload.weather) ?? pickString(payload.condition);
-  const temperature = pickString(payload.temperature) ?? pickString(payload.temp);
-  const observedAt = pickString(payload.observedAt) ?? pickString(payload.timestamp);
-  const error = pickString(payload.error);
-
-  if (error) {
-    return [`- Service error: ${error}`];
-  }
-
-  const lines: string[] = [];
-  if (city) {
-    lines.push(`- City: ${city}`);
-  }
-  if (weather) {
-    lines.push(`- Weather: ${weather}`);
-  }
-  if (temperature) {
-    lines.push(`- Temperature: ${temperature}`);
-  }
-  if (observedAt) {
-    lines.push(`- Observed at: ${observedAt}`);
-  }
-
-  return lines.length > 0 ? lines : ["- Weather data: returned (see JSON below)"];
-}
-
-function formatDataResultForHumans(result: DataResult): string {
-  const statusText = result.payment_success ? "SUCCESS" : "NOT_COMPLETED";
-  const txText = result.transaction_hash ?? "N/A";
-  return [
-    "x402 Resource Result",
-    `- payment_success: ${statusText}`,
-    `- transaction_hash: ${txText}`,
-    ...buildWeatherPreview(result.weather_json),
-    "",
-    "machine_json",
-    "```json",
-    safeJsonStringify(result),
-    "```"
-  ].join("\n");
-}
-
-function buildFriendlyError(error: unknown): string {
-  if (axios.isAxiosError(error)) {
-    const status = error.response?.status;
-    if (status === 402) {
-      const paymentMeta = extractPaymentRequirementMeta(error);
-      if (paymentMeta?.reason === "insufficient_funds") {
-        return "Payment failed due to insufficient funds. Fund wallet with enough token balance and retry.";
-      }
-      return "Payment required. Please ensure wallet has sufficient USDC and retry.";
-    }
-    if (status === 404) {
-      return "City or endpoint not found. Please verify city name and endpoint configuration.";
-    }
-    if (status === 408 || error.code === "ECONNABORTED") {
-      return "Request timed out. Please retry in a few seconds.";
-    }
-    if (status && status >= 500) {
-      return "Weather service is unavailable. Please retry later.";
-    }
-    return `Request failed (${status ?? "unknown"}): ${error.message}`;
-  }
-  return error instanceof Error ? error.message : "Unknown error";
-}
-
+/**
+ * MCP 服务启动入口。
+ *
+ * 注册两个工具：
+ * 1) get-weather(city, date?)：按城市查询，直接返回上游原始响应
+ * 2) get-data-from-resource-server()：直接访问资源端点，返回上游原始响应
+ */
 async function main() {
   const api = await createPaidHttpClient();
 
@@ -218,84 +133,65 @@ async function main() {
     },
     async ({ city, date }) => {
       try {
+        // 该请求由支付包装器处理：遇到 HTTP 402 时会自动完成支付并重试。
         const response = await api.get(endpointPath, {
           params: { city, date }
         });
-        const paymentMeta = extractPaymentMeta(response.headers);
-
-        const payload = response.data as Record<string, unknown>;
-        const weather = String(payload.weather ?? payload.condition ?? "unknown");
-        const temperature = String(payload.temperature ?? payload.temp ?? "unknown");
-        const observedAt = String(payload.observedAt ?? payload.timestamp ?? new Date().toISOString());
-
-        const summary = `${city} ${date ? `(${date}) ` : ""}weather: ${weather}, temperature: ${temperature}.`;
-        const humanText = [
-          "Weather Query Result",
-          `- city: ${city}`,
-          `- date: ${date ?? "today"}`,
-          `- weather: ${weather}`,
-          `- temperature: ${temperature}`,
-          `- observed_at: ${observedAt}`,
-          `- payment_success: ${paymentMeta.paymentSuccess ? "SUCCESS" : "NOT_COMPLETED"}`,
-          `- transaction_hash: ${paymentMeta.transactionHash ?? "N/A"}`,
-          "",
-          "machine_json",
-          "```json",
-          safeJsonStringify({
+        const result: RawToolResult = {
+          ok: true,
+          source: {
+            url: baseURL,
+            path: endpointPath
+          },
+          request: {
+            tool: "get-weather",
             city,
-            date: date ?? null,
-            weather,
-            temperature,
-            observedAt,
-            paymentSuccess: paymentMeta.paymentSuccess,
-            transactionHash: paymentMeta.transactionHash,
-            summary,
-            raw: payload
-          }),
-          "```"
-        ].join("\n");
+            date: date ?? null
+          },
+          upstream: {
+            status: response.status ?? 200,
+            payment_response_header: getHeaderValue(response.headers, "payment-response") ?? null,
+            x_payment_response_header: getHeaderValue(response.headers, "x-payment-response") ?? null,
+            data: response.data
+          }
+        };
 
         return {
           content: [
             {
               type: "text",
-              text: humanText
+              text: toRawOutput(result)
             }
           ]
         };
       } catch (error) {
-        const paymentMeta = axios.isAxiosError(error)
-          ? extractPaymentMeta(error.response?.headers)
-          : { paymentSuccess: false, transactionHash: null };
-        const paymentRequirement = extractPaymentRequirementMeta(error);
-        const machineResult = {
-          city,
-          date: date ?? null,
-          error: buildFriendlyError(error),
-          paymentSuccess: paymentMeta.paymentSuccess,
-          transactionHash: paymentMeta.transactionHash,
-          paymentRequirement,
-          hint: "Check wallet balance, endpoint config, and city spelling."
+        const result: RawToolResult = {
+          ok: false,
+          source: {
+            url: baseURL,
+            path: endpointPath
+          },
+          request: {
+            tool: "get-weather",
+            city,
+            date: date ?? null
+          },
+          upstream: {
+            status: axios.isAxiosError(error) ? (error.response?.status ?? null) : null,
+            payment_response_header: axios.isAxiosError(error)
+              ? getHeaderValue(error.response?.headers, "payment-response") ?? null
+              : null,
+            x_payment_response_header: axios.isAxiosError(error)
+              ? getHeaderValue(error.response?.headers, "x-payment-response") ?? null
+              : null,
+            data: axios.isAxiosError(error) ? error.response?.data ?? { message: error.message } : { message: String(error) }
+          }
         };
-        const humanText = [
-          "Weather Query Result",
-          `- city: ${city}`,
-          `- date: ${date ?? "today"}`,
-          `- status: FAILED`,
-          `- reason: ${machineResult.error}`,
-          `- payment_success: ${paymentMeta.paymentSuccess ? "SUCCESS" : "NOT_COMPLETED"}`,
-          `- transaction_hash: ${paymentMeta.transactionHash ?? "N/A"}`,
-          "",
-          "machine_json",
-          "```json",
-          safeJsonStringify(machineResult),
-          "```"
-        ].join("\n");
         return {
           content: [
             {
               type: "text",
-              text: humanText
+              text: toRawOutput(result)
             }
           ]
         };
@@ -309,40 +205,60 @@ async function main() {
     {},
     async () => {
       try {
+        // 极简抓取模式：直接返回上游原始响应，不做业务解析。
         const response = await api.get(endpointPath);
-        const paymentMeta = extractPaymentMeta(response.headers);
-        const result: DataResult = {
-          payment_success: paymentMeta.paymentSuccess,
-          transaction_hash: paymentMeta.transactionHash,
-          weather_json: response.data
+        const result: RawToolResult = {
+          ok: true,
+          source: {
+            url: baseURL,
+            path: endpointPath
+          },
+          request: {
+            tool: "get-data-from-resource-server"
+          },
+          upstream: {
+            status: response.status ?? 200,
+            payment_response_header: getHeaderValue(response.headers, "payment-response") ?? null,
+            x_payment_response_header: getHeaderValue(response.headers, "x-payment-response") ?? null,
+            data: response.data
+          }
         };
 
         return {
           content: [
             {
               type: "text",
-              text: formatDataResultForHumans(result)
+              text: toRawOutput(result)
             }
           ]
         };
       } catch (error) {
-        const paymentMeta = axios.isAxiosError(error)
-          ? extractPaymentMeta(error.response?.headers)
-          : { paymentSuccess: false, transactionHash: null };
-        const weatherJson = axios.isAxiosError(error) && error.response
-          ? error.response.data
-          : { error: buildFriendlyError(error) };
-        const result: DataResult = {
-          payment_success: paymentMeta.paymentSuccess,
-          transaction_hash: paymentMeta.transactionHash,
-          weather_json: weatherJson
+        const result: RawToolResult = {
+          ok: false,
+          source: {
+            url: baseURL,
+            path: endpointPath
+          },
+          request: {
+            tool: "get-data-from-resource-server"
+          },
+          upstream: {
+            status: axios.isAxiosError(error) ? (error.response?.status ?? null) : null,
+            payment_response_header: axios.isAxiosError(error)
+              ? getHeaderValue(error.response?.headers, "payment-response") ?? null
+              : null,
+            x_payment_response_header: axios.isAxiosError(error)
+              ? getHeaderValue(error.response?.headers, "x-payment-response") ?? null
+              : null,
+            data: axios.isAxiosError(error) ? error.response?.data ?? { message: error.message } : { message: String(error) }
+          }
         };
 
         return {
           content: [
             {
               type: "text",
-              text: formatDataResultForHumans(result)
+              text: toRawOutput(result)
             }
           ]
         };
@@ -351,9 +267,11 @@ async function main() {
   );
 
   const transport = new StdioServerTransport();
+  // 启动 stdio 传输层，使 MCP 客户端可在当前进程调用工具。
   await server.connect(transport);
 }
 
+// 顶层异常保护：避免静默退出，并输出可见错误信息。
 main().catch((error) => {
   console.error(error);
   process.exit(1);
