@@ -22,43 +22,16 @@ const baseURL = process.env.RESOURCE_SERVER_URL ?? "http://localhost:4021";
 const endpointPath = process.env.ENDPOINT_PATH ?? "/weather";
 const requestTimeoutMs = Number(process.env.REQUEST_TIMEOUT_MS ?? 15000);
 
+// x402 对接阅读顺序（与官方 axios 接入思路一致）：
+// 1) createPaidHttpClient: 注册支付签名方案并包装 axios
+// 2) fetchCityWeatherWithRetry: 发起请求，402 由包装器自动支付并重试
+// 3) extractTxHashFromHeaders: 从 payment-response 读取交易哈希
+// 4) formatFixedWeatherOutput: 生成面向用户的结果
+// 5) main: 注册 MCP 工具并串联调用流程
+
 // 至少需要一个可用签名器（EVM 或 SVM），否则无法完成任何 x402 支付流程。
 if (!evmPrivateKey && !svmPrivateKey) {
   throw new Error("At least one of EVM_PRIVATE_KEY or SVM_PRIVATE_KEY must be provided");
-}
-
-/**
- * 构建带 x402 自动支付能力的 axios 客户端。
- *
- * 流程：
- * 1) 创建 x402 客户端容器
- * 2) 使用配置中的私钥注册 EVM 和/或 SVM 支付方案
- * 3) 用支付中间件包装 axios，使 HTTP 402 可自动支付并重试
- */
-async function createPaidHttpClient() {
-  const client = new x402Client();
-
-  // 若提供了 EVM 私钥，则注册 EVM 签名器（例如 Base Sepolia）。
-  if (evmPrivateKey) {
-    registerExactEvmScheme(client, { signer: privateKeyToAccount(evmPrivateKey) });
-  }
-
-  // 若提供了 SVM 私钥，则注册 SVM（Solana）签名器。
-  if (svmPrivateKey) {
-    const kitModule = (await import("@solana/kit")) as unknown as {
-      createKeyPairSignerFromBytes: (secret: Uint8Array) => Promise<unknown>;
-    };
-    const signer = await kitModule.createKeyPairSignerFromBytes(base58.decode(svmPrivateKey));
-    registerExactSvmScheme(client, { signer: signer as never });
-  }
-
-  return wrapAxiosWithPayment(
-    axios.create({
-      baseURL,
-      timeout: requestTimeoutMs
-    }),
-    client
-  );
 }
 
 type RawToolResult = {
@@ -85,6 +58,8 @@ type FixedWeatherResult = {
   txLink: string | null;
   chainStatus: "Success" | "Unknown";
 };
+
+type OutputLanguage = "zh" | "en" | "ja" | "ko" | "ru";
 
 /**
  * 以不区分大小写的方式读取响应头。
@@ -133,6 +108,7 @@ function toText(value: unknown, fallback: string): string {
   return fallback;
 }
 
+// Step 3: 从 x402 支付响应头里提取链上交易哈希。
 function extractTxHashFromHeaders(headers: unknown): string | null {
   const encoded = getHeaderValue(headers, "payment-response") ?? getHeaderValue(headers, "x-payment-response");
   if (!encoded) {
@@ -147,19 +123,130 @@ function extractTxHashFromHeaders(headers: unknown): string | null {
   }
 }
 
-function formatFixedWeatherOutput(result: FixedWeatherResult): string {
+function makeTxLink(txHash: string | null): string | null {
+  return txHash ? `https://sepolia.basescan.org/tx/${txHash}` : null;
+}
+
+function detectOutputLanguage(text: string): OutputLanguage {
+  if (/[\u4e00-\u9fff]/.test(text)) return "zh";
+  if (/[\u3040-\u30ff]/.test(text)) return "ja";
+  if (/[\uac00-\ud7af]/.test(text)) return "ko";
+  if (/[\u0400-\u04FF]/.test(text)) return "ru";
+  return "en";
+}
+
+function localizeWeatherText(weather: string, language: OutputLanguage): string {
+  const normalized = weather.trim().toLowerCase();
+  const zhMap: Record<string, string> = {
+    sunny: "晴",
+    cloudy: "多云",
+    rain: "雨",
+    rainy: "雨",
+    snow: "雪",
+    snowy: "雪",
+    windy: "有风",
+    foggy: "雾",
+    stormy: "风暴",
+    thunderstorm: "雷暴"
+  };
+  if (language === "zh") {
+    return zhMap[normalized] ?? weather;
+  }
+  return weather;
+}
+
+// Step 4: 将天气和交易信息格式化为用户可读文本。
+function formatFixedWeatherOutput(result: FixedWeatherResult, language: OutputLanguage): string {
   const txHashText = result.txHash ?? "N/A";
   const txLinkText = result.txLink ?? "N/A";
+  const weatherText = localizeWeatherText(result.weather, language);
+
+  if (language === "zh") {
+    return [
+      `城市：${result.city}`,
+      `天气：${weatherText}`,
+      `温度：${result.temperature}`,
+      `请求状态：${result.status}（已完成 x402 支付重试）`,
+      `交易哈希：${txHashText}`,
+      `交易链接：${txLinkText}（链上状态 ${result.chainStatus}）`
+    ].join("\n");
+  }
+
+  if (language === "ja") {
+    return [
+      `都市：${result.city}`,
+      `天気：${weatherText}`,
+      `気温：${result.temperature}`,
+      `リクエスト状態：${result.status}（x402 支払いリトライ完了）`,
+      `トランザクションハッシュ：${txHashText}`,
+      `取引リンク：${txLinkText}（チェーン状態 ${result.chainStatus}）`
+    ].join("\n");
+  }
+
+  if (language === "ko") {
+    return [
+      `도시: ${result.city}`,
+      `날씨: ${weatherText}`,
+      `기온: ${result.temperature}`,
+      `요청 상태: ${result.status} (x402 결제 재시도 완료)`,
+      `트랜잭션 해시: ${txHashText}`,
+      `거래 링크: ${txLinkText} (체인 상태 ${result.chainStatus})`
+    ].join("\n");
+  }
+
+  if (language === "ru") {
+    return [
+      `Город: ${result.city}`,
+      `Погода: ${weatherText}`,
+      `Температура: ${result.temperature}`,
+      `Статус запроса: ${result.status} (повтор с x402-оплатой выполнен)`,
+      `Хэш транзакции: ${txHashText}`,
+      `Ссылка на транзакцию: ${txLinkText} (статус в сети ${result.chainStatus})`
+    ].join("\n");
+  }
+
   return [
-    `城市：${result.city}`,
-    `天气：${result.weather}`,
-    `温度：${result.temperature}`,
-    `请求状态：${result.status}（已完成 x402 支付重试）`,
-    `交易哈希：${txHashText}`,
-    `交易链接：${txLinkText}（链上状态 ${result.chainStatus}）`
+    `City: ${result.city}`,
+    `Weather: ${weatherText}`,
+    `Temperature: ${result.temperature}`,
+    `Request status: ${result.status} (x402 payment retry completed)`,
+    `Transaction hash: ${txHashText}`,
+    `Transaction link: ${txLinkText} (on-chain status ${result.chainStatus})`
   ].join("\n");
 }
 
+// Step 1: 按官方流程创建支付客户端并包装 axios。
+// 官方流程对应：
+// - 创建 x402Client
+// - 注册支付方案（EVM/SVM 签名器）
+// - wrapAxiosWithPayment 后直接发请求
+// - 遇到 402 时中间件自动完成支付并重试
+async function createPaidHttpClient() {
+  const client = new x402Client();
+
+  if (evmPrivateKey) {
+    registerExactEvmScheme(client, { signer: privateKeyToAccount(evmPrivateKey) });
+  }
+
+  if (svmPrivateKey) {
+    const kitModule = (await import("@solana/kit")) as unknown as {
+      createKeyPairSignerFromBytes: (secret: Uint8Array) => Promise<unknown>;
+    };
+    const signer = await kitModule.createKeyPairSignerFromBytes(base58.decode(svmPrivateKey));
+    registerExactSvmScheme(client, { signer: signer as never });
+  }
+
+  return wrapAxiosWithPayment(
+    axios.create({
+      baseURL,
+      timeout: requestTimeoutMs
+    }),
+    client
+  );
+}
+
+// Step 2: 发起业务请求，并在网络抖动时做轻量重试。
+// 402 支付重试由 wrapAxiosWithPayment 自动处理，这里只负责请求编排与结果抽取。
 async function fetchCityWeatherWithRetry(
   api: ReturnType<typeof wrapAxiosWithPayment>,
   city: string,
@@ -178,7 +265,7 @@ async function fetchCityWeatherWithRetry(
       const weather = toText(report.weather, "sunny");
       const temperature = toText(report.temperature, "70");
       const txHash = extractTxHashFromHeaders(response.headers);
-      const txLink = txHash ? `https://sepolia.basescan.org/tx/${txHash}` : null;
+      const txLink = makeTxLink(txHash);
 
       return {
         city,
@@ -199,7 +286,7 @@ async function fetchCityWeatherWithRetry(
 
   if (axios.isAxiosError(lastError)) {
     const txHash = extractTxHashFromHeaders(lastError.response?.headers);
-    const txLink = txHash ? `https://sepolia.basescan.org/tx/${txHash}` : null;
+    const txLink = makeTxLink(txHash);
     const body = (lastError.response?.data ?? {}) as Record<string, unknown>;
     const report = (body.report as Record<string, unknown> | undefined) ?? body;
     return {
@@ -224,6 +311,48 @@ async function fetchCityWeatherWithRetry(
   };
 }
 
+function buildRawSuccessResult(request: Record<string, unknown>, response: {
+  status?: number;
+  headers?: unknown;
+  data?: unknown;
+}): RawToolResult {
+  return {
+    ok: true,
+    source: {
+      url: baseURL,
+      path: endpointPath
+    },
+    request,
+    upstream: {
+      status: response.status ?? 200,
+      payment_response_header: getHeaderValue(response.headers, "payment-response") ?? null,
+      x_payment_response_header: getHeaderValue(response.headers, "x-payment-response") ?? null,
+      data: response.data
+    }
+  };
+}
+
+function buildRawErrorResult(request: Record<string, unknown>, error: unknown): RawToolResult {
+  return {
+    ok: false,
+    source: {
+      url: baseURL,
+      path: endpointPath
+    },
+    request,
+    upstream: {
+      status: axios.isAxiosError(error) ? (error.response?.status ?? null) : null,
+      payment_response_header: axios.isAxiosError(error)
+        ? getHeaderValue(error.response?.headers, "payment-response") ?? null
+        : null,
+      x_payment_response_header: axios.isAxiosError(error)
+        ? getHeaderValue(error.response?.headers, "x-payment-response") ?? null
+        : null,
+      data: axios.isAxiosError(error) ? error.response?.data ?? { message: error.message } : { message: String(error) }
+    }
+  };
+}
+
 /**
  * MCP 服务启动入口。
  *
@@ -231,6 +360,7 @@ async function fetchCityWeatherWithRetry(
  * 1) get-weather(city, date?)：按城市查询，直接返回上游原始响应
  * 2) get-data-from-resource-server(city)：按城市查询并格式化输出支付与交易信息
  */
+// Step 5: 注册 MCP 工具并串联整个调用流程。
 async function main() {
   const api = await createPaidHttpClient();
 
@@ -239,6 +369,7 @@ async function main() {
     version: "1.0.0"
   });
 
+  // Tool A: 原始返回模式，保留上游返回结构（便于调试与二次解析）。
   server.tool(
     "get-weather",
     "Get weather for a city and optional date",
@@ -252,24 +383,14 @@ async function main() {
         const response = await api.get(endpointPath, {
           params: { city, date }
         });
-        const result: RawToolResult = {
-          ok: true,
-          source: {
-            url: baseURL,
-            path: endpointPath
-          },
-          request: {
+        const result = buildRawSuccessResult(
+          {
             tool: "get-weather",
             city,
             date: date ?? null
           },
-          upstream: {
-            status: response.status ?? 200,
-            payment_response_header: getHeaderValue(response.headers, "payment-response") ?? null,
-            x_payment_response_header: getHeaderValue(response.headers, "x-payment-response") ?? null,
-            data: response.data
-          }
-        };
+          response
+        );
 
         return {
           content: [
@@ -280,28 +401,14 @@ async function main() {
           ]
         };
       } catch (error) {
-        const result: RawToolResult = {
-          ok: false,
-          source: {
-            url: baseURL,
-            path: endpointPath
-          },
-          request: {
+        const result = buildRawErrorResult(
+          {
             tool: "get-weather",
             city,
             date: date ?? null
           },
-          upstream: {
-            status: axios.isAxiosError(error) ? (error.response?.status ?? null) : null,
-            payment_response_header: axios.isAxiosError(error)
-              ? getHeaderValue(error.response?.headers, "payment-response") ?? null
-              : null,
-            x_payment_response_header: axios.isAxiosError(error)
-              ? getHeaderValue(error.response?.headers, "x-payment-response") ?? null
-              : null,
-            data: axios.isAxiosError(error) ? error.response?.data ?? { message: error.message } : { message: String(error) }
-          }
-        };
+          error
+        );
         return {
           content: [
             {
@@ -314,20 +421,23 @@ async function main() {
     }
   );
 
+  // Tool B: 用户展示模式，输出“天气 + 交易哈希 + 浏览器链接”固定模板。
   server.tool(
     "get-data-from-resource-server",
     "Fetch city weather with x402 auto-payment and readable output",
     {
-      city: z.string().min(1).describe("City name from the current dialogue, e.g. Guangzhou, Moscow")
+      city: z.string().min(1).describe("City name from the current dialogue, e.g. Guangzhou, Moscow"),
+      question: z.string().optional().describe("Original user question used for language detection")
     },
-    async ({ city }) => {
-      // 根据调用传入的城市查询；不再在服务端写死具体城市。
+    async ({ city, question }) => {
+      // 根据调用传入的城市查询
       const fixedResult = await fetchCityWeatherWithRetry(api, city, 3);
+      const language = detectOutputLanguage((question ?? city).trim());
       return {
         content: [
           {
             type: "text",
-            text: formatFixedWeatherOutput(fixedResult)
+            text: formatFixedWeatherOutput(fixedResult, language)
           }
         ]
       };
