@@ -8,6 +8,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { base58 } from "@scure/base";
 import { config } from "dotenv";
 import { z } from "zod";
+import { WEATHER_AGENT_EXECUTION_PROMPT } from "./weather-agent-prompt.js";
 // 加载本地 .env 到 process.env，供 MCP 运行时读取私钥与接口配置。
 config();
 // 运行时配置说明：
@@ -196,12 +197,12 @@ async function createPaidHttpClient() {
 }
 // Step 2: 发起业务请求，并在网络抖动时做轻量重试。
 // 402 支付重试由 wrapAxiosWithPayment 自动处理，这里只负责请求编排与结果抽取。
-async function fetchCityWeatherWithRetry(api, city, maxAttempts = 3) {
+async function fetchCityWeatherWithRetry(api, city, date, maxAttempts = 3) {
     let lastError = null;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         try {
             const response = await api.get(endpointPath, {
-                params: { city }
+                params: { city, date }
             });
             const body = response.data;
             const report = body.report ?? body;
@@ -301,6 +302,16 @@ async function main() {
         name: "x402-weather-agent",
         version: "1.0.0"
     });
+    server.tool("get-weather-agent-prompt", "Get fixed execution prompt for weather MCP workflow", {}, async () => {
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: WEATHER_AGENT_EXECUTION_PROMPT
+                }
+            ]
+        };
+    });
     // Tool A: 原始返回模式，保留上游返回结构（便于调试与二次解析）。
     server.tool("get-weather", "Get weather for a city and optional date", {
         city: z.string().min(1).describe("City name, e.g. Beijing"),
@@ -342,12 +353,13 @@ async function main() {
         }
     });
     // Tool B: 用户展示模式，输出“天气 + 交易哈希 + 浏览器链接”固定模板。
-    server.tool("get-data-from-resource-server", "Fetch city weather with x402 auto-payment and readable output", {
+    server.tool("get-data-from-resource-server", "Fetch city weather with x402 auto-payment and return FINAL user-facing text. Use this text verbatim as final answer. Do not paraphrase, prepend/append content, or ask follow-up questions.", {
         city: z.string().min(1).describe("City name from the current dialogue, e.g. Guangzhou, Moscow"),
+        date: z.string().optional().describe("Optional date, e.g. 2026-02-13"),
         question: z.string().optional().describe("Original user question used for language detection")
-    }, async ({ city, question }) => {
+    }, async ({ city, date, question }) => {
         // 根据调用传入的城市查询
-        const fixedResult = await fetchCityWeatherWithRetry(api, city, 3);
+        const fixedResult = await fetchCityWeatherWithRetry(api, city, date, 3);
         const language = detectOutputLanguage((question ?? city).trim());
         return {
             content: [
