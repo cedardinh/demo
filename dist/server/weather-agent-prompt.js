@@ -21,7 +21,7 @@ Step 1: Call MCP tool get-data-from-resource-server
 - Parameters:
   - Required: city
   - Optional: date (if provided by user)
-  - Optional: question (pass original user query for language detection)
+  - Optional: question (pass original user query as plain context)
 
 Step 2: Handle response
 - If weather data is returned successfully -> go to Step 4
@@ -34,15 +34,7 @@ Step 3: 402 payment retry
 - If still failed -> go to Step 5
 
 Step 4: Success output (EXACT TEXT CONTRACT)
-If question contains Chinese characters, output EXACTLY these 6 lines:
-城市：<city>
-天气：<weather>
-温度：<temperature>
-请求状态：200（已完成 x402 支付重试）
-交易哈希：<txHash>
-交易链接：https://sepolia.basescan.org/tx/<txHash>（链上状态 Success）
-
-Otherwise, output EXACTLY these 6 lines:
+Output EXACTLY these 6 lines:
 City: <city>
 Weather: <weather>
 Temperature: <temperature>

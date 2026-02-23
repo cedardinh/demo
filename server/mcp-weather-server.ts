@@ -60,8 +60,6 @@ type FixedWeatherResult = {
   chainStatus: "Success" | "Unknown";
 };
 
-type OutputLanguage = "zh" | "en" | "ja" | "ko" | "ru";
-
 /**
  * 以不区分大小写的方式读取响应头。
  * Axios/Node 可能会对 header 名做不同规范化，因此同时尝试原始/小写/大写键名。
@@ -128,87 +126,13 @@ function makeTxLink(txHash: string | null): string | null {
   return txHash ? `https://sepolia.basescan.org/tx/${txHash}` : null;
 }
 
-function detectOutputLanguage(text: string): OutputLanguage {
-  if (/[\u4e00-\u9fff]/.test(text)) return "zh";
-  if (/[\u3040-\u30ff]/.test(text)) return "ja";
-  if (/[\uac00-\ud7af]/.test(text)) return "ko";
-  if (/[\u0400-\u04FF]/.test(text)) return "ru";
-  return "en";
-}
-
-function localizeWeatherText(weather: string, language: OutputLanguage): string {
-  const normalized = weather.trim().toLowerCase();
-  const zhMap: Record<string, string> = {
-    sunny: "晴",
-    cloudy: "多云",
-    rain: "雨",
-    rainy: "雨",
-    snow: "雪",
-    snowy: "雪",
-    windy: "有风",
-    foggy: "雾",
-    stormy: "风暴",
-    thunderstorm: "雷暴"
-  };
-  if (language === "zh") {
-    return zhMap[normalized] ?? weather;
-  }
-  return weather;
-}
-
 // Step 4: 将天气和交易信息格式化为用户可读文本。
-function formatFixedWeatherOutput(result: FixedWeatherResult, language: OutputLanguage): string {
+function formatFixedWeatherOutput(result: FixedWeatherResult): string {
   const txHashText = result.txHash ?? "N/A";
   const txLinkText = result.txLink ?? "N/A";
-  const weatherText = localizeWeatherText(result.weather, language);
-
-  if (language === "zh") {
-    return [
-      `城市：${result.city}`,
-      `天气：${weatherText}`,
-      `温度：${result.temperature}`,
-      `请求状态：${result.status}（已完成 x402 支付重试）`,
-      `交易哈希：${txHashText}`,
-      `交易链接：${txLinkText}（链上状态 ${result.chainStatus}）`
-    ].join("\n");
-  }
-
-  if (language === "ja") {
-    return [
-      `都市：${result.city}`,
-      `天気：${weatherText}`,
-      `気温：${result.temperature}`,
-      `リクエスト状態：${result.status}（x402 支払いリトライ完了）`,
-      `トランザクションハッシュ：${txHashText}`,
-      `取引リンク：${txLinkText}（チェーン状態 ${result.chainStatus}）`
-    ].join("\n");
-  }
-
-  if (language === "ko") {
-    return [
-      `도시: ${result.city}`,
-      `날씨: ${weatherText}`,
-      `기온: ${result.temperature}`,
-      `요청 상태: ${result.status} (x402 결제 재시도 완료)`,
-      `트랜잭션 해시: ${txHashText}`,
-      `거래 링크: ${txLinkText} (체인 상태 ${result.chainStatus})`
-    ].join("\n");
-  }
-
-  if (language === "ru") {
-    return [
-      `Город: ${result.city}`,
-      `Погода: ${weatherText}`,
-      `Температура: ${result.temperature}`,
-      `Статус запроса: ${result.status} (повтор с x402-оплатой выполнен)`,
-      `Хэш транзакции: ${txHashText}`,
-      `Ссылка на транзакцию: ${txLinkText} (статус в сети ${result.chainStatus})`
-    ].join("\n");
-  }
-
   return [
     `City: ${result.city}`,
-    `Weather: ${weatherText}`,
+    `Weather: ${result.weather}`,
     `Temperature: ${result.temperature}`,
     `Request status: ${result.status} (x402 payment retry completed)`,
     `Transaction hash: ${txHashText}`,
@@ -446,17 +370,16 @@ async function main() {
     {
       city: z.string().min(1).describe("City name from the current dialogue, e.g. Guangzhou, Moscow"),
       date: z.string().optional().describe("Optional date, e.g. 2026-02-13"),
-      question: z.string().optional().describe("Original user question used for language detection")
+      question: z.string().optional().describe("Original user question as optional context")
     },
-    async ({ city, date, question }) => {
+    async ({ city, date }) => {
       // 根据调用传入的城市查询
       const fixedResult = await fetchCityWeatherWithRetry(api, city, date, 3);
-      const language = detectOutputLanguage((question ?? city).trim());
       return {
         content: [
           {
             type: "text",
-            text: formatFixedWeatherOutput(fixedResult, language)
+            text: formatFixedWeatherOutput(fixedResult)
           }
         ]
       };
